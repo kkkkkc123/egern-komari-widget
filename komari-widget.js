@@ -31,8 +31,41 @@ const C = {
 
 const LOCK_TEXT = { light: '#111827', dark: '#F8FAFC' };
 const LOCK_MUTED = { light: '#4B5563', dark: '#CBD5E1' };
+const LONG_TERM_DAYS = 3650;
 
 export default async function (ctx) {
+  try {
+    return await buildKomariWidget(ctx);
+  } catch (error) {
+    // Keep this fallback deliberately minimal. If a device/runtime rejects one
+    // of the richer layout branches, Egern should show the actual error instead
+    // of rendering a completely blank widget.
+    return {
+      type: 'widget',
+      padding: 14,
+      gap: 6,
+      backgroundColor: '#2B1720',
+      children: [
+        {
+          type: 'text',
+          text: 'Komari 小组件运行失败',
+          font: { size: 14, weight: 'bold' },
+          textColor: '#FFFFFF',
+        },
+        {
+          type: 'text',
+          text: shortError(error),
+          font: { size: 11, weight: 'medium' },
+          textColor: '#FFB4C0',
+          maxLines: 4,
+          minScale: 0.7,
+        },
+      ],
+    };
+  }
+}
+
+async function buildKomariWidget(ctx) {
   const env = ctx.env || {};
   const family = ctx.widgetFamily || 'systemMedium';
   const baseUrl = normalizeBaseUrl(env.KOMARI_URL || env.URL || '');
@@ -108,7 +141,8 @@ export default async function (ctx) {
   if (family === 'accessoryRectangular') return rectangularWidget(visibleNodes, meta);
   if (family === 'systemSmall') return smallWidget(visibleNodes[0], meta);
   if (family === 'systemExtraLarge') return extraLargeWidget(visibleNodes, meta);
-  return dashboardWidget(visibleNodes, meta, family === 'systemLarge');
+  if (family === 'systemLarge') return largeWidget(visibleNodes, meta);
+  return dashboardWidget(visibleNodes, meta);
 }
 
 async function fetchKomari(ctx, options) {
@@ -124,10 +158,17 @@ async function fetchKomari(ctx, options) {
 }
 
 async function fetchRpc2(ctx, options) {
-  const requests = [
+  const requiredRequests = [
     { jsonrpc: '2.0', id: 'nodes', method: 'common:getNodes', params: {} },
     { jsonrpc: '2.0', id: 'status', method: 'common:getNodesLatestStatus', params: {} },
   ];
+  const pingRequest = {
+    jsonrpc: '2.0',
+    id: 'ping',
+    method: 'common:getRecords',
+    params: { type: 'ping', hours: 1, maxCount: 500 },
+  };
+  const requests = [...requiredRequests, pingRequest];
   let replies;
 
   // JSON-RPC batch is one network request. Some older RPC2 builds may not accept
@@ -142,11 +183,17 @@ async function fetchRpc2(ctx, options) {
     if (!Array.isArray(json)) throw new Error('服务器不支持 JSON-RPC batch');
     replies = json;
   } catch (_) {
-    replies = await Promise.all(requests.map((request) => rpcCall(ctx, options, request)));
+    replies = await Promise.all(requiredRequests.map((request) => rpcCall(ctx, options, request)));
+    try {
+      replies.push(await rpcCall(ctx, options, pingRequest));
+    } catch (_) {
+      // Ping data is optional and must never block the core server metrics.
+    }
   }
 
   const nodesResult = rpcResult(replies, 'nodes');
   const statusResult = rpcResult(replies, 'status') || {};
+  const pingStats = normalizePingStats(optionalRpcResult(replies, 'ping'));
   const rawNodes = Array.isArray(nodesResult)
     ? nodesResult
     : Object.keys(nodesResult || {}).map((key) => nodesResult[key]);
@@ -154,7 +201,11 @@ async function fetchRpc2(ctx, options) {
   if (!rawNodes.length) throw new Error('没有可见节点或认证失败');
 
   return {
-    nodes: rawNodes.map((node) => normalizeNode(node, statusResult[node.uuid] || null)),
+    nodes: rawNodes.map((node) => normalizeNode(
+      node,
+      statusResult[node.uuid] || null,
+      pingStats[node.uuid] || null,
+    )),
   };
 }
 
@@ -175,6 +226,45 @@ function rpcResult(replies, id) {
     throw new Error(message);
   }
   return reply.result;
+}
+
+function optionalRpcResult(replies, id) {
+  const reply = replies.find((item) => String(item && item.id) === id);
+  return reply && !reply.error ? reply.result : null;
+}
+
+function normalizePingStats(result) {
+  const output = {};
+  if (!result || typeof result !== 'object') return output;
+
+  const basicInfo = Array.isArray(result.basic_info) ? result.basic_info : [];
+  for (const item of basicInfo) {
+    const uuid = String(item && item.client || '');
+    if (!uuid) continue;
+    output[uuid] = {
+      latency: firstNumber(item.avg, item.min),
+      loss: clamp(numberOrZero(item.loss), 0, 100),
+    };
+  }
+
+  const samples = {};
+  const records = Array.isArray(result.records) ? result.records : [];
+  for (const record of records) {
+    const uuid = String(record && record.client || '');
+    const latency = numberOrNull(record && record.value);
+    if (!uuid || latency === null || latency < 0) continue;
+    if (!samples[uuid]) samples[uuid] = [];
+    samples[uuid].push(latency);
+  }
+
+  for (const uuid of Object.keys(samples)) {
+    const values = samples[uuid];
+    const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+    if (!output[uuid]) output[uuid] = { latency: null, loss: null };
+    output[uuid].latency = average;
+  }
+
+  return output;
 }
 
 async function fetchLegacyRest(ctx, options) {
@@ -266,8 +356,9 @@ function normalizeLegacyStatus(record) {
   };
 }
 
-function normalizeNode(node, status) {
+function normalizeNode(node, status, ping) {
   const state = status || {};
+  const pingState = ping || {};
   const ramTotal = firstNumber(state.ram_total, node.mem_total);
   const diskTotal = firstNumber(state.disk_total, node.disk_total);
   const ramUsed = numberOrNull(state.ram);
@@ -299,6 +390,8 @@ function normalizeNode(node, status) {
     uptime: numberOrNull(state.uptime),
     connections: numberOrNull(state.connections),
     process: numberOrNull(state.process),
+    latency: numberOrNull(pingState.latency),
+    loss: numberOrNull(pingState.loss),
     expiredAt: node.expired_at || null,
     autoRenewal: Boolean(node.auto_renewal),
     trafficLimit: numberOrZero(node.traffic_limit),
@@ -355,8 +448,8 @@ function smallWidget(node, meta) {
         {
           type: 'stack', direction: 'column', gap: 5, flex: 1,
           children: [
-            smallMetric('RAM', node.ramPercent, C.cyan),
-            smallMetric('DISK', node.diskPercent, C.purple),
+            smallMetric('内存', node.ramPercent, C.cyan),
+            smallMetric('硬盘', node.diskPercent, C.purple),
           ],
         },
       ],
@@ -385,12 +478,227 @@ function smallWidget(node, meta) {
   ], 13, 5);
 }
 
-function dashboardWidget(nodes, meta, detailed) {
+function dashboardWidget(nodes, meta) {
   const children = [dashboardHeader(meta)];
-  for (const node of nodes) children.push(nodeRow(node, detailed));
+  for (const node of nodes) children.push(nodeRow(node, false));
   children.push({ type: 'spacer' });
   children.push(networkFooter(meta));
-  return baseWidget(meta, children, detailed ? 14 : 12, detailed ? 7 : 6);
+  return baseWidget(meta, children, 12, 6);
+}
+
+function largeWidget(nodes, meta) {
+  return baseWidget(meta, [
+    dashboardHeader(meta),
+    largeOverview(nodes, meta),
+    {
+      type: 'stack',
+      direction: 'column',
+      alignItems: 'start',
+      gap: 6,
+      flex: 1,
+      children: nodes.map((node) => largeNodeCard(node)),
+    },
+    largeFooter(meta),
+  ], 12, 7);
+}
+
+function largeOverview(nodes, meta) {
+  const averageLatency = averageNodeMetric(nodes, 'latency');
+  const averageLoss = averageNodeMetric(nodes, 'loss');
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 6,
+    children: [
+      overviewCard(
+        '在线节点',
+        `${meta.online}/${meta.total}`,
+        meta.online === meta.total ? '全部正常' : `${meta.total - meta.online} 台离线`,
+        'checkmark.circle.fill',
+        meta.online === meta.total ? C.green : C.yellow,
+      ),
+      overviewCard(
+        '实时网络',
+        `↓ ${formatSpeed(meta.totalDown)}`,
+        `↑ ${formatSpeed(meta.totalUp)}`,
+        'arrow.up.arrow.down.circle.fill',
+        C.blue,
+      ),
+      overviewCard(
+        '网络质量',
+        `延迟 ${formatLatency(averageLatency)}`,
+        `丢包 ${formatLoss(averageLoss)}`,
+        'waveform.path.ecg',
+        networkHealthColor({ latency: averageLatency, loss: averageLoss }),
+      ),
+    ],
+  };
+}
+
+function overviewCard(label, value, detail, icon, color) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 1,
+    flex: 1,
+    padding: [5, 6],
+    backgroundColor: '#FFFFFF0D',
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: '#FFFFFF14',
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 4,
+        children: [
+          symbol(icon, color, 11),
+          text(label, 9, C.muted, 'semibold', 1),
+        ],
+      },
+      text(value, 12, C.text, 'bold', 1),
+      text(detail, 9, color, 'medium', 1),
+    ],
+  };
+}
+
+function largeNodeCard(node) {
+  const name = text(
+    `${node.region ? `${node.region} ` : ''}${node.name}`,
+    13,
+    C.text,
+    'bold',
+    1,
+  );
+  name.flex = 1;
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 3,
+    flex: 1,
+    padding: [5, 8],
+    backgroundGradient: {
+      type: 'linear',
+      colors: ['#FFFFFF10', node.online ? '#2563EB16' : '#BE123C16'],
+      stops: [0, 1],
+      startPoint: { x: 0, y: 0 },
+      endPoint: { x: 1, y: 1 },
+    },
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: node.online ? '#60A5FA32' : '#FB718532',
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
+        children: [
+          name,
+          statusBadge(node.online),
+          text(expiryLabel(node), 9, expiryColor(node), 'semibold', 1),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 8,
+        children: [
+          metricGauge('CPU', node.cpu, metricColor(node.cpu)),
+          metricGauge('内存', node.ramPercent, metricColor(node.ramPercent)),
+          metricGauge('硬盘', node.diskPercent, metricColor(node.diskPercent)),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
+        children: [
+          symbol('arrow.down', C.green, 9),
+          text(formatSpeed(node.netDown), 9, C.secondary, 'medium'),
+          symbol('arrow.up', C.blue, 9),
+          text(formatSpeed(node.netUp), 9, C.secondary, 'medium'),
+          { type: 'spacer' },
+          text(
+            `延迟 ${formatLatency(node.latency)} · 丢包 ${formatLoss(node.loss)}`,
+            9,
+            networkHealthColor(node),
+            'semibold',
+            1,
+          ),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
+        children: [
+          symbol('chart.pie.fill', C.cyan, 10),
+          text(trafficLabel(node), 9, C.secondary, 'medium', 1),
+          { type: 'spacer' },
+          trafficGauge(node),
+        ],
+      },
+    ],
+  };
+}
+
+function metricGauge(label, value, color) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 2,
+    flex: 1,
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center',
+        children: [
+          text(label, 9, C.muted, 'semibold'),
+          { type: 'spacer' },
+          text(displayPercent(value), 10, color, 'bold'),
+        ],
+      },
+      segmentedGauge(value, color, 10),
+    ],
+  };
+}
+
+function trafficGauge(node) {
+  if (node.trafficLimit <= 0) return text('不限流量', 9, C.muted, 'medium');
+  const usage = percent(node.trafficUsed, node.trafficLimit);
+  const gauge = segmentedGauge(usage, metricColor(usage), 8);
+  gauge.width = 68;
+  return gauge;
+}
+
+function segmentedGauge(value, color, segments) {
+  const active = Number.isFinite(value)
+    ? clamp(Math.ceil(value / (100 / segments)), 0, segments)
+    : 0;
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 2,
+    height: 4,
+    children: Array.from({ length: segments }, (_, index) => ({
+      type: 'stack',
+      flex: 1,
+      height: 4,
+      backgroundColor: index < active ? color : '#FFFFFF14',
+      borderRadius: 2,
+      children: [],
+    })),
+  };
+}
+
+function statusBadge(online) {
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 3,
+    padding: [1, 5],
+    backgroundColor: online ? '#34D39920' : '#FB718520',
+    borderRadius: 7,
+    children: [
+      statusDot(online, 6),
+      text(online ? '在线' : '离线', 9, online ? C.green : C.red, 'semibold'),
+    ],
+  };
 }
 
 function extraLargeWidget(nodes, meta) {
@@ -431,14 +739,22 @@ function dashboardHeader(meta) {
 }
 
 function nodeRow(node, detailed) {
+  const nodeName = text(
+    `${node.region ? `${node.region} ` : ''}${node.name}`,
+    detailed ? 13 : 11,
+    C.text,
+    'semibold',
+    1,
+  );
+  nodeName.flex = 1;
   const top = {
     type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
     children: [
       statusDot(node.online, 8),
-      text(`${node.region ? `${node.region} ` : ''}${node.name}`, detailed ? 13 : 12, C.text, 'semibold', 1),
-      metricText('C', node.cpu, metricColor(node.cpu)),
-      metricText('R', node.ramPercent, metricColor(node.ramPercent)),
-      metricText('D', node.diskPercent, metricColor(node.diskPercent)),
+      nodeName,
+      metricText('CPU', node.cpu, metricColor(node.cpu), detailed ? 10 : 9),
+      metricText('内存', node.ramPercent, metricColor(node.ramPercent), detailed ? 10 : 9),
+      metricText('硬盘', node.diskPercent, metricColor(node.diskPercent), detailed ? 10 : 9),
     ],
   };
   const children = [top];
@@ -447,6 +763,20 @@ function nodeRow(node, detailed) {
       type: 'stack', direction: 'row', alignItems: 'center', gap: 4,
       children: [
         text(node.online ? `↓ ${formatSpeed(node.netDown)}  ↑ ${formatSpeed(node.netUp)}` : '暂无实时数据', 10, C.muted, 'medium', 1),
+        { type: 'spacer' },
+        text(
+          `延迟 ${formatLatency(node.latency)} · 丢包 ${formatLoss(node.loss)}`,
+          10,
+          networkHealthColor(node),
+          'medium',
+          1,
+        ),
+      ],
+    });
+    children.push({
+      type: 'stack', direction: 'row', alignItems: 'center', gap: 4,
+      children: [
+        text(trafficLabel(node), 10, C.secondary, 'medium', 1),
         { type: 'spacer' },
         text(expiryLabel(node), 10, expiryColor(node), 'medium', 1),
       ],
@@ -475,6 +805,20 @@ function networkFooter(meta) {
       text(formatSpeed(meta.totalUp), 10, C.secondary, 'medium'),
       { type: 'spacer' },
       dateText(meta.fetchedAt, 10, C.muted),
+    ],
+  };
+}
+
+function largeFooter(meta) {
+  return {
+    type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
+    children: [
+      symbol('clock.arrow.circlepath', meta.stale ? C.yellow : C.cyan, 11),
+      text(meta.stale ? '正在显示缓存数据' : '数据更新于', 9, meta.stale ? C.yellow : C.muted, 'medium'),
+      dateText(meta.fetchedAt, 9, C.secondary),
+      { type: 'spacer' },
+      symbol('arrow.up.right.square', C.blue, 10),
+      text('打开 Komari', 9, C.secondary, 'semibold'),
     ],
   };
 }
@@ -518,7 +862,13 @@ function rectangularWidget(nodes, meta) {
       children: [
         statusDot(node.online, 6),
         text(`${node.region ? `${node.region} ` : ''}${node.name}`, 10, LOCK_TEXT, 'semibold', 1),
-        text(`C${Math.round(node.cpu)} R${displayPercent(node.ramPercent)}`, 9, LOCK_MUTED, 'medium'),
+        text(
+          `CPU ${Math.round(node.cpu)}% · 内存 ${displayPercent(node.ramPercent)} · 硬盘 ${displayPercent(node.diskPercent)}`,
+          8,
+          LOCK_MUTED,
+          'medium',
+          1,
+        ),
       ],
     });
   }
@@ -582,8 +932,8 @@ function smallMetric(label, value, color) {
   };
 }
 
-function metricText(label, value, color) {
-  return text(`${label} ${displayPercent(value)}`, 10, color, 'semibold');
+function metricText(label, value, color, size) {
+  return text(`${label} ${displayPercent(value)}`, size || 10, color, 'semibold');
 }
 
 function symbol(name, color, size) {
@@ -621,7 +971,7 @@ function dateText(date, size, color) {
 
 function familyLimit(family) {
   if (family === 'systemSmall') return 1;
-  if (family === 'systemLarge') return 6;
+  if (family === 'systemLarge') return 3;
   if (family === 'systemExtraLarge') return 10;
   if (family === 'accessoryRectangular') return 2;
   if (family === 'accessoryInline' || family === 'accessoryCircular') return 1;
@@ -652,14 +1002,58 @@ function formatSpeed(bytes) {
   return `${trimNumber(bytes / 1024 ** 3)} G/s`;
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '--';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 ** 2) return `${trimNumber(bytes / 1024)} KB`;
+  if (bytes < 1024 ** 3) return `${trimNumber(bytes / 1024 ** 2)} MB`;
+  if (bytes < 1024 ** 4) return `${trimNumber(bytes / 1024 ** 3)} GB`;
+  return `${trimNumber(bytes / 1024 ** 4)} TB`;
+}
+
+function trafficLabel(node) {
+  const used = numberOrZero(node.trafficUsed);
+  if (node.trafficLimit > 0) {
+    const usage = percent(used, node.trafficLimit);
+    return `流量 ${formatBytes(used)} / ${formatBytes(node.trafficLimit)} (${displayPercent(usage)})`;
+  }
+  return `流量 ${formatBytes(used)}`;
+}
+
+function formatLatency(value) {
+  return Number.isFinite(value) ? `${Math.round(value)}ms` : '--';
+}
+
+function formatLoss(value) {
+  return Number.isFinite(value) ? `${trimNumber(value)}%` : '--';
+}
+
+function networkHealthColor(node) {
+  if (!Number.isFinite(node.latency) && !Number.isFinite(node.loss)) return C.muted;
+  if (node.loss >= 10 || node.latency >= 300) return C.red;
+  if (node.loss >= 3 || node.latency >= 180) return C.yellow;
+  return C.green;
+}
+
+function averageNodeMetric(nodes, key) {
+  const values = nodes
+    .map((node) => numberOrNull(node[key]))
+    .filter((value) => value !== null);
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
 function trimNumber(value) {
   return value >= 100 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '');
 }
 
 function expiryLabel(node) {
   if (!node.expiredAt) return node.autoRenewal ? '自动续费' : '未设到期';
-  const days = Math.ceil((new Date(node.expiredAt).getTime() - Date.now()) / 86400000);
+  const timestamp = new Date(node.expiredAt).getTime();
+  if (!Number.isFinite(timestamp) || timestamp < Date.UTC(2000, 0, 1)) return '未设到期';
+  const days = Math.ceil((timestamp - Date.now()) / 86400000);
   if (!Number.isFinite(days)) return '到期未知';
+  if (days > LONG_TERM_DAYS) return '长期有效';
   if (days < 0) return `已到期 ${Math.abs(days)}天`;
   if (days === 0) return '今天到期';
   return `${days}天到期`;
@@ -669,6 +1063,7 @@ function expiryColor(node) {
   if (!node.expiredAt) return C.muted;
   const days = (new Date(node.expiredAt).getTime() - Date.now()) / 86400000;
   if (!Number.isFinite(days)) return C.muted;
+  if (days > LONG_TERM_DAYS) return C.green;
   if (days < 7) return C.red;
   if (days < 30) return C.yellow;
   return C.muted;

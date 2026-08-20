@@ -2,15 +2,23 @@ name: "Komari VPS Widget"
 description: "在 Egern iOS 小组件中显示 Komari VPS 运行状态"
 author: "kkkkkc123"
 homepage: "https://github.com/kkkkkc123/egern-komari-widget"
+manual: "https://github.com/kkkkkc123/egern-komari-widget#readme"
+icon: "server.rack"
 
-# 安装模块后，请在模块的 Env 中设置：
-# KOMARI_URL=https://status.example.com
-# API_KEY=你的 Komari API Key（公开面板可以留空）
+env_schema:
+  KOMARI_URL:
+    name: "Komari 面板地址"
+    description: "填写面板根地址，例如 https://status.example.com，不要添加 /api"
+    default_value: "https://status.example.com"
+  API_KEY:
+    name: "Komari API Key"
+    description: "私有站点或隐藏节点需要；公开面板可留空"
 
 scriptings:
   - generic:
       name: "komari-widget"
       script_url: "https://raw.githubusercontent.com/kkkkkc123/egern-komari-widget/main/komari-widget.js"
+      update_interval: 300
       timeout: 20
 
 widgets:
