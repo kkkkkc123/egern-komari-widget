@@ -132,8 +132,7 @@ async function buildKomariWidget(ctx) {
     stale,
     total: nodes.length,
     online: nodes.filter((node) => node.online).length,
-    totalDown: nodes.reduce((sum, node) => sum + numberOrZero(node.netDown), 0),
-    totalUp: nodes.reduce((sum, node) => sum + numberOrZero(node.netUp), 0),
+    alerts: summarizeAlerts(nodes),
   };
 
   if (family === 'accessoryInline') return inlineWidget(meta);
@@ -458,11 +457,9 @@ function smallWidget(node, meta) {
     {
       type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
       children: [
-        symbol('arrow.down', C.green, 10),
-        text(formatSpeed(node.netDown), 10, C.secondary, 'medium'),
-        { type: 'spacer', length: 5 },
-        symbol('arrow.up', C.blue, 10),
-        text(formatSpeed(node.netUp), 10, C.secondary, 'medium'),
+        symbol('waveform.path.ecg', networkHealthColor(node), 10),
+        text(`延迟 ${formatLatency(node.latency)}`, 10, C.secondary, 'medium'),
+        text(`丢包 ${formatLoss(node.loss)}`, 10, networkHealthColor(node), 'medium'),
         { type: 'spacer' },
         text(expiryLabel(node), 10, expiryColor(node), 'medium', 1),
       ],
@@ -505,6 +502,7 @@ function largeWidget(nodes, meta) {
 function largeOverview(nodes, meta) {
   const averageLatency = averageNodeMetric(nodes, 'latency');
   const averageLoss = averageNodeMetric(nodes, 'loss');
+  const alerts = meta.alerts;
   return {
     type: 'stack',
     direction: 'row',
@@ -514,16 +512,16 @@ function largeOverview(nodes, meta) {
       overviewCard(
         '在线节点',
         `${meta.online}/${meta.total}`,
-        meta.online === meta.total ? '全部正常' : `${meta.total - meta.online} 台离线`,
+        meta.online === meta.total ? '全部在线' : `${meta.total - meta.online} 台离线`,
         'checkmark.circle.fill',
         meta.online === meta.total ? C.green : C.yellow,
       ),
       overviewCard(
-        '实时网络',
-        `↓ ${formatSpeed(meta.totalDown)}`,
-        `↑ ${formatSpeed(meta.totalUp)}`,
-        'arrow.up.arrow.down.circle.fill',
-        C.blue,
+        '待处理提醒',
+        alerts.value,
+        alerts.detail,
+        alerts.icon,
+        alerts.color,
       ),
       overviewCard(
         '网络质量',
@@ -563,6 +561,7 @@ function overviewCard(label, value, detail, icon, color) {
 }
 
 function largeNodeCard(node) {
+  const attention = nodeAttention(node);
   const name = text(
     `${node.region ? `${node.region} ` : ''}${node.name}`,
     13,
@@ -608,10 +607,8 @@ function largeNodeCard(node) {
       {
         type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
         children: [
-          symbol('arrow.down', C.green, 9),
-          text(formatSpeed(node.netDown), 9, C.secondary, 'medium'),
-          symbol('arrow.up', C.blue, 9),
-          text(formatSpeed(node.netUp), 9, C.secondary, 'medium'),
+          symbol(attention.icon, attention.color, 9),
+          text(attention.text, 9, attention.color, 'semibold', 1),
           { type: 'spacer' },
           text(
             `延迟 ${formatLatency(node.latency)} · 丢包 ${formatLoss(node.loss)}`,
@@ -739,6 +736,7 @@ function dashboardHeader(meta) {
 }
 
 function nodeRow(node, detailed) {
+  const attention = nodeAttention(node);
   const nodeName = text(
     `${node.region ? `${node.region} ` : ''}${node.name}`,
     detailed ? 13 : 11,
@@ -762,7 +760,8 @@ function nodeRow(node, detailed) {
     children.push({
       type: 'stack', direction: 'row', alignItems: 'center', gap: 4,
       children: [
-        text(node.online ? `↓ ${formatSpeed(node.netDown)}  ↑ ${formatSpeed(node.netUp)}` : '暂无实时数据', 10, C.muted, 'medium', 1),
+        symbol(attention.icon, attention.color, 9),
+        text(attention.text, 10, attention.color, 'medium', 1),
         { type: 'spacer' },
         text(
           `延迟 ${formatLatency(node.latency)} · 丢包 ${formatLoss(node.loss)}`,
@@ -796,14 +795,20 @@ function nodeRow(node, detailed) {
 }
 
 function networkFooter(meta) {
+  const alerts = meta.alerts;
+  const summary = text(
+    alerts.count ? `提醒 ${alerts.count} 项 · ${alerts.detail}` : '暂无待处理提醒',
+    10,
+    alerts.color,
+    'semibold',
+    1,
+  );
+  summary.flex = 1;
   return {
     type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
     children: [
-      symbol('arrow.down.circle.fill', C.green, 12),
-      text(formatSpeed(meta.totalDown), 10, C.secondary, 'medium'),
-      symbol('arrow.up.circle.fill', C.blue, 12),
-      text(formatSpeed(meta.totalUp), 10, C.secondary, 'medium'),
-      { type: 'spacer' },
+      symbol(alerts.icon, alerts.color, 11),
+      summary,
       dateText(meta.fetchedAt, 10, C.muted),
     ],
   };
@@ -994,14 +999,6 @@ function percent(used, total) {
   return clamp((used / total) * 100, 0, 100);
 }
 
-function formatSpeed(bytes) {
-  if (!Number.isFinite(bytes) || bytes < 0) return '--';
-  if (bytes < 1024) return `${Math.round(bytes)} B/s`;
-  if (bytes < 1024 ** 2) return `${trimNumber(bytes / 1024)} K/s`;
-  if (bytes < 1024 ** 3) return `${trimNumber(bytes / 1024 ** 2)} M/s`;
-  return `${trimNumber(bytes / 1024 ** 3)} G/s`;
-}
-
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return '--';
   if (bytes < 1024) return `${Math.round(bytes)} B`;
@@ -1033,6 +1030,83 @@ function networkHealthColor(node) {
   if (node.loss >= 10 || node.latency >= 300) return C.red;
   if (node.loss >= 3 || node.latency >= 180) return C.yellow;
   return C.green;
+}
+
+function summarizeAlerts(nodes) {
+  const alerts = [];
+  for (const node of nodes) alerts.push(...collectNodeAlerts(node));
+  alerts.sort((a, b) => b.priority - a.priority);
+  if (!alerts.length) {
+    return {
+      count: 0,
+      value: '暂无异常',
+      detail: '全部指标正常',
+      icon: 'checkmark.shield.fill',
+      color: C.green,
+    };
+  }
+  const first = alerts[0];
+  return {
+    count: alerts.length,
+    value: `${alerts.length} 项需关注`,
+    detail: `${first.node.name} · ${first.text}`,
+    icon: first.icon,
+    color: first.color,
+  };
+}
+
+function nodeAttention(node) {
+  const alerts = collectNodeAlerts(node).sort((a, b) => b.priority - a.priority);
+  if (!alerts.length) {
+    return { text: '状态正常', icon: 'checkmark.shield.fill', color: C.green };
+  }
+  return alerts[0];
+}
+
+function collectNodeAlerts(node) {
+  const alerts = [];
+  const add = (textValue, priority, critical) => alerts.push({
+    node,
+    text: textValue,
+    priority,
+    icon: critical ? 'xmark.octagon.fill' : 'exclamationmark.triangle.fill',
+    color: critical ? C.red : C.yellow,
+  });
+
+  if (!node.online) add('节点离线', 100, true);
+
+  const days = alertExpiryDays(node);
+  if (days !== null) {
+    if (days < 0) add('已经到期', 95, true);
+    else if (days <= 7) add(`${days}天内到期`, 90, true);
+    else if (days <= 30) add(`${days}天到期`, 70, false);
+  }
+
+  const trafficPercent = percent(node.trafficUsed, node.trafficLimit);
+  if (trafficPercent !== null) {
+    if (trafficPercent >= 90) add(`流量已用 ${Math.round(trafficPercent)}%`, 85, true);
+    else if (trafficPercent >= 80) add(`流量已用 ${Math.round(trafficPercent)}%`, 60, false);
+  }
+
+  if (Number.isFinite(node.diskPercent)) {
+    if (node.diskPercent >= 95) add(`硬盘已用 ${Math.round(node.diskPercent)}%`, 80, true);
+    else if (node.diskPercent >= 85) add(`硬盘已用 ${Math.round(node.diskPercent)}%`, 55, false);
+  }
+
+  if (Number.isFinite(node.loss)) {
+    if (node.loss >= 10) add(`丢包 ${trimNumber(node.loss)}%`, 75, true);
+    else if (node.loss >= 3) add(`丢包 ${trimNumber(node.loss)}%`, 50, false);
+  }
+
+  return alerts;
+}
+
+function alertExpiryDays(node) {
+  if (!node.expiredAt) return null;
+  const timestamp = new Date(node.expiredAt).getTime();
+  if (!Number.isFinite(timestamp) || timestamp < Date.UTC(2000, 0, 1)) return null;
+  const days = Math.ceil((timestamp - Date.now()) / 86400000);
+  return days > LONG_TERM_DAYS ? null : days;
 }
 
 function averageNodeMetric(nodes, key) {
