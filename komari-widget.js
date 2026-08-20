@@ -141,7 +141,8 @@ async function buildKomariWidget(ctx) {
   if (family === 'accessoryRectangular') return rectangularWidget(visibleNodes, meta);
   if (family === 'systemSmall') return smallWidget(visibleNodes[0], meta);
   if (family === 'systemExtraLarge') return extraLargeWidget(visibleNodes, meta);
-  return dashboardWidget(visibleNodes, meta, family === 'systemLarge');
+  if (family === 'systemLarge') return largeWidget(visibleNodes, meta);
+  return dashboardWidget(visibleNodes, meta);
 }
 
 async function fetchKomari(ctx, options) {
@@ -477,12 +478,227 @@ function smallWidget(node, meta) {
   ], 13, 5);
 }
 
-function dashboardWidget(nodes, meta, detailed) {
+function dashboardWidget(nodes, meta) {
   const children = [dashboardHeader(meta)];
-  for (const node of nodes) children.push(nodeRow(node, detailed));
+  for (const node of nodes) children.push(nodeRow(node, false));
   children.push({ type: 'spacer' });
   children.push(networkFooter(meta));
-  return baseWidget(meta, children, detailed ? 14 : 12, detailed ? 7 : 6);
+  return baseWidget(meta, children, 12, 6);
+}
+
+function largeWidget(nodes, meta) {
+  return baseWidget(meta, [
+    dashboardHeader(meta),
+    largeOverview(nodes, meta),
+    {
+      type: 'stack',
+      direction: 'column',
+      alignItems: 'start',
+      gap: 6,
+      flex: 1,
+      children: nodes.map((node) => largeNodeCard(node)),
+    },
+    largeFooter(meta),
+  ], 12, 7);
+}
+
+function largeOverview(nodes, meta) {
+  const averageLatency = averageNodeMetric(nodes, 'latency');
+  const averageLoss = averageNodeMetric(nodes, 'loss');
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 6,
+    children: [
+      overviewCard(
+        '在线节点',
+        `${meta.online}/${meta.total}`,
+        meta.online === meta.total ? '全部正常' : `${meta.total - meta.online} 台离线`,
+        'checkmark.circle.fill',
+        meta.online === meta.total ? C.green : C.yellow,
+      ),
+      overviewCard(
+        '实时网络',
+        `↓ ${formatSpeed(meta.totalDown)}`,
+        `↑ ${formatSpeed(meta.totalUp)}`,
+        'arrow.up.arrow.down.circle.fill',
+        C.blue,
+      ),
+      overviewCard(
+        '网络质量',
+        `延迟 ${formatLatency(averageLatency)}`,
+        `丢包 ${formatLoss(averageLoss)}`,
+        'waveform.path.ecg',
+        networkHealthColor({ latency: averageLatency, loss: averageLoss }),
+      ),
+    ],
+  };
+}
+
+function overviewCard(label, value, detail, icon, color) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 1,
+    flex: 1,
+    padding: [5, 6],
+    backgroundColor: '#FFFFFF0D',
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: '#FFFFFF14',
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 4,
+        children: [
+          symbol(icon, color, 11),
+          text(label, 9, C.muted, 'semibold', 1),
+        ],
+      },
+      text(value, 12, C.text, 'bold', 1),
+      text(detail, 9, color, 'medium', 1),
+    ],
+  };
+}
+
+function largeNodeCard(node) {
+  const name = text(
+    `${node.region ? `${node.region} ` : ''}${node.name}`,
+    13,
+    C.text,
+    'bold',
+    1,
+  );
+  name.flex = 1;
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 3,
+    flex: 1,
+    padding: [5, 8],
+    backgroundGradient: {
+      type: 'linear',
+      colors: ['#FFFFFF10', node.online ? '#2563EB16' : '#BE123C16'],
+      stops: [0, 1],
+      startPoint: { x: 0, y: 0 },
+      endPoint: { x: 1, y: 1 },
+    },
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: node.online ? '#60A5FA32' : '#FB718532',
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
+        children: [
+          name,
+          statusBadge(node.online),
+          text(expiryLabel(node), 9, expiryColor(node), 'semibold', 1),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 8,
+        children: [
+          metricGauge('CPU', node.cpu, metricColor(node.cpu)),
+          metricGauge('内存', node.ramPercent, metricColor(node.ramPercent)),
+          metricGauge('硬盘', node.diskPercent, metricColor(node.diskPercent)),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
+        children: [
+          symbol('arrow.down', C.green, 9),
+          text(formatSpeed(node.netDown), 9, C.secondary, 'medium'),
+          symbol('arrow.up', C.blue, 9),
+          text(formatSpeed(node.netUp), 9, C.secondary, 'medium'),
+          { type: 'spacer' },
+          text(
+            `延迟 ${formatLatency(node.latency)} · 丢包 ${formatLoss(node.loss)}`,
+            9,
+            networkHealthColor(node),
+            'semibold',
+            1,
+          ),
+        ],
+      },
+      {
+        type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
+        children: [
+          symbol('chart.pie.fill', C.cyan, 10),
+          text(trafficLabel(node), 9, C.secondary, 'medium', 1),
+          { type: 'spacer' },
+          trafficGauge(node),
+        ],
+      },
+    ],
+  };
+}
+
+function metricGauge(label, value, color) {
+  return {
+    type: 'stack',
+    direction: 'column',
+    alignItems: 'start',
+    gap: 2,
+    flex: 1,
+    children: [
+      {
+        type: 'stack', direction: 'row', alignItems: 'center',
+        children: [
+          text(label, 9, C.muted, 'semibold'),
+          { type: 'spacer' },
+          text(displayPercent(value), 10, color, 'bold'),
+        ],
+      },
+      segmentedGauge(value, color, 10),
+    ],
+  };
+}
+
+function trafficGauge(node) {
+  if (node.trafficLimit <= 0) return text('不限流量', 9, C.muted, 'medium');
+  const usage = percent(node.trafficUsed, node.trafficLimit);
+  const gauge = segmentedGauge(usage, metricColor(usage), 8);
+  gauge.width = 68;
+  return gauge;
+}
+
+function segmentedGauge(value, color, segments) {
+  const active = Number.isFinite(value)
+    ? clamp(Math.ceil(value / (100 / segments)), 0, segments)
+    : 0;
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 2,
+    height: 4,
+    children: Array.from({ length: segments }, (_, index) => ({
+      type: 'stack',
+      flex: 1,
+      height: 4,
+      backgroundColor: index < active ? color : '#FFFFFF14',
+      borderRadius: 2,
+      children: [],
+    })),
+  };
+}
+
+function statusBadge(online) {
+  return {
+    type: 'stack',
+    direction: 'row',
+    alignItems: 'center',
+    gap: 3,
+    padding: [1, 5],
+    backgroundColor: online ? '#34D39920' : '#FB718520',
+    borderRadius: 7,
+    children: [
+      statusDot(online, 6),
+      text(online ? '在线' : '离线', 9, online ? C.green : C.red, 'semibold'),
+    ],
+  };
 }
 
 function extraLargeWidget(nodes, meta) {
@@ -589,6 +805,20 @@ function networkFooter(meta) {
       text(formatSpeed(meta.totalUp), 10, C.secondary, 'medium'),
       { type: 'spacer' },
       dateText(meta.fetchedAt, 10, C.muted),
+    ],
+  };
+}
+
+function largeFooter(meta) {
+  return {
+    type: 'stack', direction: 'row', alignItems: 'center', gap: 5,
+    children: [
+      symbol('clock.arrow.circlepath', meta.stale ? C.yellow : C.cyan, 11),
+      text(meta.stale ? '正在显示缓存数据' : '数据更新于', 9, meta.stale ? C.yellow : C.muted, 'medium'),
+      dateText(meta.fetchedAt, 9, C.secondary),
+      { type: 'spacer' },
+      symbol('arrow.up.right.square', C.blue, 10),
+      text('打开 Komari', 9, C.secondary, 'semibold'),
     ],
   };
 }
@@ -741,7 +971,7 @@ function dateText(date, size, color) {
 
 function familyLimit(family) {
   if (family === 'systemSmall') return 1;
-  if (family === 'systemLarge') return 4;
+  if (family === 'systemLarge') return 3;
   if (family === 'systemExtraLarge') return 10;
   if (family === 'accessoryRectangular') return 2;
   if (family === 'accessoryInline' || family === 'accessoryCircular') return 1;
@@ -803,6 +1033,14 @@ function networkHealthColor(node) {
   if (node.loss >= 10 || node.latency >= 300) return C.red;
   if (node.loss >= 3 || node.latency >= 180) return C.yellow;
   return C.green;
+}
+
+function averageNodeMetric(nodes, key) {
+  const values = nodes
+    .map((node) => numberOrNull(node[key]))
+    .filter((value) => value !== null);
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function trimNumber(value) {
